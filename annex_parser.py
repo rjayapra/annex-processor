@@ -3,6 +3,7 @@ Annex A PDF Parser
 Extracts reference tables from Annex A sections in PDF files.
 """
 
+import csv
 import pdfplumber
 import pandas as pd
 import re
@@ -21,10 +22,34 @@ logger = logging.getLogger(__name__)
 class AnnexAParser:
     """Parser for extracting Annex A reference tables from PDF files."""
     
+    CSV_FIELDNAMES = ['qsp_filename', 'reference_number', 'ndid_document_control_no', 'title_of_reference']
+
     def __init__(self, pdf_folder: str = "data", output_file: str = "annex_a_references.csv"):
         self.pdf_folder = Path(pdf_folder)
         self.output_file = output_file
         self.results = []
+        self._csv_file = None
+        self._csv_writer = None
+
+    def _init_csv(self):
+        """Open the CSV file and write the header row."""
+        self._csv_file = open(self.output_file, 'w', newline='', encoding='utf-8-sig')
+        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=self.CSV_FIELDNAMES)
+        self._csv_writer.writeheader()
+
+    def _write_row(self, row: Dict):
+        """Write a single parsed row to the CSV file immediately."""
+        if self._csv_writer is None:
+            self._init_csv()
+        self._csv_writer.writerow(row)
+        self._csv_file.flush()
+
+    def _close_csv(self):
+        """Close the CSV file handle."""
+        if self._csv_file:
+            self._csv_file.close()
+            self._csv_file = None
+            self._csv_writer = None
         
     def extract_ndid_from_title(self, title: str) -> tuple[Optional[str], str]:
         """
@@ -161,6 +186,86 @@ class AnnexAParser:
             'title_of_reference': title
         }
     
+    def parse_references_from_text(self, text: str, qsp_filename: str) -> List[Dict]:
+        """
+        Fallback parser: extract references from raw page text when no
+        structured table is found.  Handles lines like:
+            A1  A-AD-121-C01/FP-000 - Staff and Writing Procedures ...
+        Multi-line entries (continuation lines without a ref code) are
+        appended to the previous entry.
+        """
+        results = []
+        if not text:
+            return results
+
+        lines = text.split('\n')
+
+        # Regex for a reference line: starts with a ref code like A1, B12, C3, D1, etc.
+        ref_line_re = re.compile(
+            r'^\s*([A-D]\d{1,3})\s+(.+)',  # e.g.  A1  <rest of line>
+        )
+
+        current_ref = None
+        current_text = ""
+
+        # Lines to skip
+        skip_re = re.compile(
+            r'^(ANNEX|QSP|Ref\b|Code\b|Chapters?\s|A\s*=|B\s*=|C\s*=|D\s*=|A\s*-\s*\d|Qty|Required)',
+            re.IGNORECASE,
+        )
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            m = ref_line_re.match(stripped)
+            if m:
+                # Save previous entry
+                if current_ref and current_text:
+                    ndid, title = self.extract_ndid_from_title(current_text.strip())
+                    results.append({
+                        'qsp_filename': qsp_filename,
+                        'reference_number': current_ref,
+                        'ndid_document_control_no': ndid or '',
+                        'title_of_reference': title,
+                    })
+                current_ref = m.group(1)
+                current_text = m.group(2)
+            elif current_ref and not skip_re.match(stripped):
+                # Continuation line for the current reference
+                current_text += ' ' + stripped
+
+        # Flush last entry
+        if current_ref and current_text:
+            ndid, title = self.extract_ndid_from_title(current_text.strip())
+            results.append({
+                'qsp_filename': qsp_filename,
+                'reference_number': current_ref,
+                'ndid_document_control_no': ndid or '',
+                'title_of_reference': title,
+            })
+
+        return results
+
+    def is_annex_a_heading_page(self, text: str) -> bool:
+        """
+        Return True only when the page contains a real ANNEX A heading
+        (not merely a Table-of-Contents line that mentions it).
+        TOC lines typically include dot leaders (…, .) or page numbers.
+        """
+        if not text:
+            return False
+        for line in text.split('\n'):
+            line_stripped = line.strip().upper()
+            # Accept the heading itself (possibly with dash or en-dash)
+            if re.match(r'^ANNEX\s+A\s*[–\-]\s*MAIN\s+REFERENCE', line_stripped):
+                # Reject TOC entries: they contain dot-leaders or trailing page refs
+                if '…' in line or '.....' in line or re.search(r'[A-Z]\s*-\s*\d+\s*$', line.strip()):
+                    continue
+                return True
+        return False
+
     def find_annex_a_pages(self, pdf) -> List[int]:
         """Find pages that contain 'ANNEX A - MAIN REFERENCES' section."""
         annex_pages = []
@@ -173,7 +278,8 @@ class AnnexAParser:
                 
                 text_upper = text.upper()
                 # Look specifically for "ANNEX A - MAIN REFERENCES" or "ANNEX A – MAIN REFERENCES"
-                if ('ANNEX A' in text_upper and 'MAIN REFERENCE' in text_upper):
+                if ('ANNEX A' in text_upper and 'MAIN REFERENCE' in text_upper
+                        and self.is_annex_a_heading_page(text)):
                     annex_pages.append(page_num)
                     logger.info(f"Found 'ANNEX A - MAIN REFERENCES' on page {page_num + 1}")
             except Exception as e:
@@ -203,6 +309,7 @@ class AnnexAParser:
                 
                 # Extract tables from Annex A pages and subsequent pages
                 for page_num in annex_pages:
+                    found_table = False
                     # Check current page and next few pages for tables
                     for offset in range(3):  # Check up to 3 pages after Annex A
                         if page_num + offset < len(pdf.pages):
@@ -214,16 +321,33 @@ class AnnexAParser:
                                     # Only process tables that look like reference tables
                                     if not self.is_reference_table(table):
                                         continue
-                                        
+                                    
+                                    found_table = True
                                     logger.info(f"Found reference table on page {page_num + offset + 1}")
                                     for row in table:
                                         parsed_row = self.parse_table_row(row, qsp_filename)
                                         if parsed_row:
                                             self.results.append(parsed_row)
+                                            self._write_row(parsed_row)
                                             logger.debug(f"Extracted: {parsed_row}")
                             except Exception as e:
                                 logger.warning(f"Error extracting tables from page {page_num + offset + 1}: {str(e)}")
                                 continue
+
+                    # Fallback: parse references from raw text when no
+                    # structured table was found on the Annex A page(s)
+                    if not found_table:
+                        logger.info(f"No structured table found for Annex A on page {page_num + 1}; using text-based extraction")
+                        for offset in range(3):
+                            if page_num + offset < len(pdf.pages):
+                                page_text = pdf.pages[page_num + offset].extract_text() or ''
+                                text_refs = self.parse_references_from_text(page_text, qsp_filename)
+                                for parsed_row in text_refs:
+                                    self.results.append(parsed_row)
+                                    self._write_row(parsed_row)
+                                    logger.debug(f"Extracted (text): {parsed_row}")
+                                if text_refs:
+                                    found_table = True  # prevent duplicate extraction
                 
                 logger.info(f"Extracted {len([r for r in self.results if r['qsp_filename'] == qsp_filename])} references from {pdf_path.name}")
                 
@@ -244,13 +368,14 @@ class AnnexAParser:
             self.process_pdf(pdf_path)
     
     def save_results(self):
-        """Save extracted results to CSV file."""
+        """Finalize the CSV file and log a summary."""
+        self._close_csv()
+
         if not self.results:
             logger.warning("No results to save")
             return
-        
+
         df = pd.DataFrame(self.results)
-        df.to_csv(self.output_file, index=False, encoding='utf-8-sig')
         logger.info(f"Results saved to {self.output_file}")
         logger.info(f"Total records: {len(df)}")
         logger.info(f"Unique QSP files: {df['qsp_filename'].nunique()}")
