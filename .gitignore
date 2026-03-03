@@ -35,7 +35,7 @@ env/
 
 # Output files
 *.csv
-annex_a_references.csv
+
 
 # PDF files (optional - uncomment if you don't want to commit PDFs)
 # data/*.pdf
