@@ -22,9 +22,23 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Place all your QSP PDF files in the `data/` folder
+### Download PDFs from Azure Blob Storage
 
-2. Run the parser:
+Download QSP PDF files from the Azure storage account to the `data/` folder:
+
+```bash
+python download_blobs.py
+```
+
+The script uses **DefaultAzureCredential** for authentication (Azure CLI login, managed identity, etc.). Make sure you're logged in via `az login` or have a managed identity configured.
+
+You can override the defaults with environment variables:
+- `AZURE_STORAGE_ACCOUNT` (default: `ndrcnntgdevniobe`)
+- `AZURE_CONTAINER_NAME` (default: `qsps`)
+
+The script skips files that already exist locally with the same size.
+
+### Run the parser
 ```bash
 python annex_parser.py
 ```
